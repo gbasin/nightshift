@@ -114,6 +114,7 @@ func (a *CodexAgent) Execute(ctx context.Context, opts ExecuteOptions) (*Execute
 
 	result := &ExecuteResult{
 		Output:   stdout,
+		Stderr:   stderr,
 		ExitCode: exitCode,
 		Duration: time.Since(start),
 	}

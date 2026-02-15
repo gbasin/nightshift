@@ -147,6 +147,7 @@ func (a *ClaudeAgent) Execute(ctx context.Context, opts ExecuteOptions) (*Execut
 
 	result := &ExecuteResult{
 		Output:   stdout,
+		Stderr:   stderr,
 		ExitCode: exitCode,
 		Duration: time.Since(start),
 	}

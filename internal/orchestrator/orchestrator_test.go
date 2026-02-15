@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 type mockAgent struct {
 	name      string
 	responses []agents.ExecuteResult
+	errors    []error // parallel to responses; nil means no error
 	calls     []agents.ExecuteOptions
 	callIndex int
 }
@@ -24,8 +27,26 @@ func newMockAgent(responses ...agents.ExecuteResult) *mockAgent {
 	return &mockAgent{
 		name:      "mock",
 		responses: responses,
+		errors:    make([]error, len(responses)),
 		calls:     make([]agents.ExecuteOptions, 0),
 	}
+}
+
+// newMockAgentWithErrors creates a mock agent where each response can have an associated error.
+func newMockAgentWithErrors(pairs ...any) *mockAgent {
+	m := &mockAgent{
+		name:  "mock",
+		calls: make([]agents.ExecuteOptions, 0),
+	}
+	for i := 0; i < len(pairs); i += 2 {
+		m.responses = append(m.responses, pairs[i].(agents.ExecuteResult))
+		if i+1 < len(pairs) && pairs[i+1] != nil {
+			m.errors = append(m.errors, pairs[i+1].(error))
+		} else {
+			m.errors = append(m.errors, nil)
+		}
+	}
+	return m
 }
 
 func (m *mockAgent) Name() string {
@@ -43,8 +64,12 @@ func (m *mockAgent) Execute(ctx context.Context, opts agents.ExecuteOptions) (*a
 	}
 
 	resp := m.responses[m.callIndex]
+	var err error
+	if m.callIndex < len(m.errors) {
+		err = m.errors[m.callIndex]
+	}
 	m.callIndex++
-	return &resp, nil
+	return &resp, err
 }
 
 // Helper to create JSON response.
@@ -757,5 +782,136 @@ func TestRunTaskNoPRURL(t *testing.T) {
 	}
 	if result.OutputRef != "" {
 		t.Errorf("OutputRef = %q, want empty", result.OutputRef)
+	}
+}
+
+func TestRunTaskDiagnosticLoggingOnTimeout(t *testing.T) {
+	dumpDir := t.TempDir()
+
+	// Plan phase returns a timeout error with partial output and stderr
+	timeoutResult := agents.ExecuteResult{
+		Output:   "partial plan output before timeout",
+		Stderr:   "error: rate limit exceeded",
+		ExitCode: -1,
+		Duration: 30 * time.Minute,
+		Error:    "timeout after 30m0s",
+	}
+
+	agent := newMockAgentWithErrors(
+		timeoutResult, context.DeadlineExceeded,
+	)
+	o := New(
+		WithAgent(agent),
+		WithDumpDir(dumpDir),
+	)
+
+	task := &tasks.Task{
+		ID:          "timeout-diag-test",
+		Title:       "Timeout Diagnostic Test",
+		Description: "test diagnostic logging on timeout",
+	}
+
+	result, err := o.RunTask(context.Background(), task, "/work")
+	if err == nil {
+		t.Fatal("expected error for timeout")
+	}
+	if result.Status != StatusFailed {
+		t.Errorf("status = %s, want %s", result.Status, StatusFailed)
+	}
+
+	// Verify dump file was created
+	entries, err := os.ReadDir(dumpDir)
+	if err != nil {
+		t.Fatalf("reading dump dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected dump file to be created")
+	}
+
+	// Verify dump file contents
+	dumpPath := filepath.Join(dumpDir, entries[0].Name())
+	content, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("reading dump file: %v", err)
+	}
+	dumpStr := string(content)
+
+	if !strings.Contains(dumpStr, "partial plan output before timeout") {
+		t.Error("dump missing stdout")
+	}
+	if !strings.Contains(dumpStr, "error: rate limit exceeded") {
+		t.Error("dump missing stderr")
+	}
+	if !strings.Contains(dumpStr, "Phase:     plan") {
+		t.Error("dump missing phase")
+	}
+	if !strings.Contains(dumpStr, "timeout-diag-test") {
+		t.Error("dump missing task ID")
+	}
+
+	// Verify filename pattern
+	name := entries[0].Name()
+	if !strings.HasPrefix(name, "agent-plan-timeout-diag-test-") {
+		t.Errorf("dump filename = %q, want prefix agent-plan-timeout-diag-test-", name)
+	}
+	if !strings.HasSuffix(name, ".log") {
+		t.Errorf("dump filename = %q, want .log suffix", name)
+	}
+}
+
+func TestRunTaskDiagnosticOnNonSuccessResult(t *testing.T) {
+	dumpDir := t.TempDir()
+
+	// Plan succeeds, implement returns non-success (exit code 1)
+	planResp := jsonResponse(PlanOutput{
+		Steps:       []string{"step1"},
+		Files:       []string{"file1.go"},
+		Description: "test plan",
+	})
+	implResp := agents.ExecuteResult{
+		Output:   "partial output",
+		Stderr:   "fatal: out of memory",
+		ExitCode: 1,
+		Error:    "exit status 1",
+	}
+
+	agent := newMockAgent(planResp, implResp)
+	o := New(
+		WithAgent(agent),
+		WithDumpDir(dumpDir),
+	)
+
+	task := &tasks.Task{
+		ID:          "impl-fail-test",
+		Title:       "Implement Failure Test",
+		Description: "test diagnostic on implement failure",
+	}
+
+	result, _ := o.RunTask(context.Background(), task, "/work")
+	if result.Status != StatusFailed {
+		t.Errorf("status = %s, want %s", result.Status, StatusFailed)
+	}
+
+	// Verify dump file for implement phase
+	entries, err := os.ReadDir(dumpDir)
+	if err != nil {
+		t.Fatalf("reading dump dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected dump file for implement failure")
+	}
+
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "agent-implement-") {
+			found = true
+			content, _ := os.ReadFile(filepath.Join(dumpDir, e.Name()))
+			if !strings.Contains(string(content), "fatal: out of memory") {
+				t.Error("implement dump missing stderr")
+			}
+		}
+	}
+	if !found {
+		t.Error("no implement dump file found")
 	}
 }

@@ -209,6 +209,32 @@ func TestClaudeAgent_Execute_ExitError(t *testing.T) {
 	if result.IsSuccess() {
 		t.Error("expected IsSuccess() to be false")
 	}
+	if result.Stderr != "command failed: no such file" {
+		t.Errorf("Stderr = %q, want %q", result.Stderr, "command failed: no such file")
+	}
+}
+
+func TestClaudeAgent_Execute_StderrOnSuccess(t *testing.T) {
+	mock := &MockRunner{
+		Stdout:   "completed with warnings",
+		Stderr:   "warning: deprecated API used",
+		ExitCode: 0,
+	}
+	agent := NewClaudeAgent(WithRunner(mock))
+
+	result, err := agent.Execute(context.Background(), ExecuteOptions{
+		Prompt: "task with warnings",
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsSuccess() {
+		t.Error("expected IsSuccess() to be true")
+	}
+	if result.Stderr != "warning: deprecated API used" {
+		t.Errorf("Stderr = %q, want %q", result.Stderr, "warning: deprecated API used")
+	}
 }
 
 func TestClaudeAgent_Execute_BinaryNotFound(t *testing.T) {

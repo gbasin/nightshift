@@ -118,6 +118,7 @@ type Orchestrator struct {
 	logger       *logging.Logger
 	eventHandler EventHandler // optional callback for real-time events
 	runMeta      *RunMetadata
+	dumpDir      string // directory for agent diagnostic dump files
 }
 
 // Option configures an Orchestrator.
@@ -162,6 +163,13 @@ func WithLogger(l *logging.Logger) Option {
 func WithEventHandler(h EventHandler) Option {
 	return func(o *Orchestrator) {
 		o.eventHandler = h
+	}
+}
+
+// WithDumpDir sets the directory for agent diagnostic dump files.
+func WithDumpDir(dir string) Option {
+	return func(o *Orchestrator) {
+		o.dumpDir = dir
 	}
 }
 
@@ -428,6 +436,82 @@ func (o *Orchestrator) annotatePR(ctx context.Context, prURL string, task *tasks
 	return nil
 }
 
+// logAgentDiag logs truncated agent diagnostic info and writes a full dump file.
+func (o *Orchestrator) logAgentDiag(phase string, execResult *agents.ExecuteResult, taskID string) {
+	if execResult == nil {
+		return
+	}
+
+	// Truncate for structured log output
+	truncate := func(s string, max int) string {
+		if len(s) <= max {
+			return s
+		}
+		return s[:max] + "..."
+	}
+
+	fields := map[string]any{
+		"phase":       phase,
+		"exit_code":   execResult.ExitCode,
+		"duration":    execResult.Duration.String(),
+		"agent_error": execResult.Error,
+	}
+	if execResult.Output != "" {
+		fields["stdout"] = truncate(execResult.Output, 500)
+	}
+	if execResult.Stderr != "" {
+		fields["stderr"] = truncate(execResult.Stderr, 500)
+	}
+	if o.agent != nil {
+		fields["agent"] = o.agent.Name()
+	}
+
+	o.logger.ErrorCtx("agent diagnostic", fields)
+
+	o.writeAgentDump(phase, execResult, taskID)
+}
+
+// writeAgentDump writes full agent output to a dump file for post-mortem analysis.
+func (o *Orchestrator) writeAgentDump(phase string, execResult *agents.ExecuteResult, taskID string) {
+	dir := o.dumpDir
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		dir = filepath.Join(home, ".local", "share", "nightshift", "agent-dumps")
+	}
+
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		o.logger.Errorf("failed to create dump dir: %v", err)
+		return
+	}
+
+	// Sanitize taskID for filename (replace path separators and colons)
+	safeTaskID := strings.NewReplacer("/", "_", ":", "_", " ", "_").Replace(taskID)
+	now := time.Now()
+	timestamp := now.Format("2006-01-02-150405") + fmt.Sprintf(".%03d", now.Nanosecond()/1e6)
+	filename := fmt.Sprintf("agent-%s-%s-%s.log", phase, safeTaskID, timestamp)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "=== Agent Diagnostic Dump ===\n")
+	fmt.Fprintf(&sb, "Phase:     %s\n", phase)
+	fmt.Fprintf(&sb, "Task ID:   %s\n", taskID)
+	fmt.Fprintf(&sb, "Exit Code: %d\n", execResult.ExitCode)
+	fmt.Fprintf(&sb, "Duration:  %s\n", execResult.Duration)
+	fmt.Fprintf(&sb, "Error:     %s\n", execResult.Error)
+	if o.agent != nil {
+		fmt.Fprintf(&sb, "Agent:     %s\n", o.agent.Name())
+	}
+	fmt.Fprintf(&sb, "\n=== STDOUT ===\n%s\n", execResult.Output)
+	fmt.Fprintf(&sb, "\n=== STDERR ===\n%s\n", execResult.Stderr)
+
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, []byte(sb.String()), 0600); err != nil {
+		o.logger.Errorf("failed to write dump file: %v", err)
+	}
+}
+
 // plan spawns the plan agent to create an execution plan.
 func (o *Orchestrator) plan(ctx context.Context, task *tasks.Task, workDir string) (*PlanOutput, error) {
 	prompt := o.buildPlanPrompt(task)
@@ -441,10 +525,12 @@ func (o *Orchestrator) plan(ctx context.Context, task *tasks.Task, workDir strin
 		Timeout: o.config.AgentTimeout,
 	})
 	if err != nil {
+		o.logAgentDiag("plan", execResult, task.ID)
 		return nil, fmt.Errorf("agent execution: %w", err)
 	}
 
 	if !execResult.IsSuccess() {
+		o.logAgentDiag("plan", execResult, task.ID)
 		return nil, fmt.Errorf("agent returned error: %s", execResult.Error)
 	}
 
@@ -488,10 +574,12 @@ func (o *Orchestrator) implement(ctx context.Context, task *tasks.Task, plan *Pl
 		Timeout: o.config.AgentTimeout,
 	})
 	if err != nil {
+		o.logAgentDiag("implement", execResult, task.ID)
 		return nil, fmt.Errorf("agent execution: %w", err)
 	}
 
 	if !execResult.IsSuccess() {
+		o.logAgentDiag("implement", execResult, task.ID)
 		return nil, fmt.Errorf("agent returned error: %s", execResult.Error)
 	}
 
@@ -586,10 +674,12 @@ func (o *Orchestrator) review(ctx context.Context, task *tasks.Task, impl *Imple
 		Timeout: o.config.AgentTimeout,
 	})
 	if err != nil {
+		o.logAgentDiag("review", execResult, task.ID)
 		return nil, fmt.Errorf("agent execution: %w", err)
 	}
 
 	if !execResult.IsSuccess() {
+		o.logAgentDiag("review", execResult, task.ID)
 		return nil, fmt.Errorf("agent returned error: %s", execResult.Error)
 	}
 

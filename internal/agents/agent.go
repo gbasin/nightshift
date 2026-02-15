@@ -30,6 +30,7 @@ type ExecuteOptions struct {
 // ExecuteResult holds the outcome of an agent execution.
 type ExecuteResult struct {
 	Output   string        // Agent's text output
+	Stderr   string        // Agent's stderr output (always captured)
 	JSON     []byte        // Structured JSON output if available
 	ExitCode int           // Process exit code
 	Duration time.Duration // Execution duration
